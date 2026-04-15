@@ -30,6 +30,11 @@ pub struct EmitOptions<'a> {
     /// because some analysis tools (objdiff) hide COMDAT-grouped weak
     /// symbols from their UI.
     pub comdat: bool,
+    /// Emit per-CU DWARF slices (`.debug_info`/`.debug_abbrev`/`.debug_line`)
+    /// with reloc synthesis. Off by default: the slices carry forward the
+    /// original DWARF which some parsers stumble on post-slice, and many
+    /// workflows (objdiff, relink correctness) don't need it.
+    pub dwarf: bool,
 }
 
 #[derive(Debug, Default)]
@@ -192,63 +197,62 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
         agg.adrp_unresolved += rec.diag.adrp_unresolved;
     }
 
-    // DWARF slices — per-CU .debug_info + .debug_abbrev + .debug_line.
-    // Each address-bearing field gets a relocation so the linker rewrites
-    // it for the new layout.
-    let (debug_info_section, debug_info_slice) = add_dwarf_slice(
-        &mut obj,
-        binary,
-        ".debug_info",
-        cu.debug_info_range.clone(),
-    );
-    add_dwarf_slice(
-        &mut obj,
-        binary,
-        ".debug_abbrev",
-        cu.debug_abbrev_range.clone(),
-    );
-    let (debug_line_section, debug_line_slice) = if let Some(range) = cu.debug_line_range.clone() {
-        add_dwarf_slice(&mut obj, binary, ".debug_line", range)
-    } else {
-        (None, None)
-    };
+    if opts.dwarf {
+        let (debug_info_section, debug_info_slice) = add_dwarf_slice(
+            &mut obj,
+            binary,
+            ".debug_info",
+            cu.debug_info_range.clone(),
+        );
+        add_dwarf_slice(
+            &mut obj,
+            binary,
+            ".debug_abbrev",
+            cu.debug_abbrev_range.clone(),
+        );
+        let (debug_line_section, debug_line_slice) = if let Some(range) = cu.debug_line_range.clone()
+        {
+            add_dwarf_slice(&mut obj, binary, ".debug_line", range)
+        } else {
+            (None, None)
+        };
 
-    // Synthesize DWARF relocations.
-    if let (Some(info_section), Some(info_slice), Some(abbrev_slice)) = (
-        debug_info_section,
-        debug_info_slice,
-        dwarf_section_slice(binary, ".debug_abbrev", cu.debug_abbrev_range.clone()),
-    ) {
-        match dwarf_relocs::scan_debug_info(info_slice, abbrev_slice, globals) {
-            Ok((recs, _diag)) => {
-                for r in recs {
-                    attach_dwarf_reloc(
-                        &mut obj,
-                        info_section,
-                        &mut local_syms,
-                        &mut undef_cache,
-                        &r,
-                    )?;
+        if let (Some(info_section), Some(info_slice), Some(abbrev_slice)) = (
+            debug_info_section,
+            debug_info_slice,
+            dwarf_section_slice(binary, ".debug_abbrev", cu.debug_abbrev_range.clone()),
+        ) {
+            match dwarf_relocs::scan_debug_info(info_slice, abbrev_slice, globals) {
+                Ok((recs, _diag)) => {
+                    for r in recs {
+                        attach_dwarf_reloc(
+                            &mut obj,
+                            info_section,
+                            &mut local_syms,
+                            &mut undef_cache,
+                            &r,
+                        )?;
+                    }
                 }
+                Err(e) => tracing::warn!(cu = %cu.name, error = %e, "debug_info scan failed"),
             }
-            Err(e) => tracing::warn!(cu = %cu.name, error = %e, "debug_info scan failed"),
         }
-    }
 
-    if let (Some(line_section), Some(line_slice)) = (debug_line_section, debug_line_slice) {
-        match dwarf_relocs::scan_debug_line(line_slice, globals) {
-            Ok((recs, _diag)) => {
-                for r in recs {
-                    attach_dwarf_reloc(
-                        &mut obj,
-                        line_section,
-                        &mut local_syms,
-                        &mut undef_cache,
-                        &r,
-                    )?;
+        if let (Some(line_section), Some(line_slice)) = (debug_line_section, debug_line_slice) {
+            match dwarf_relocs::scan_debug_line(line_slice, globals) {
+                Ok((recs, _diag)) => {
+                    for r in recs {
+                        attach_dwarf_reloc(
+                            &mut obj,
+                            line_section,
+                            &mut local_syms,
+                            &mut undef_cache,
+                            &r,
+                        )?;
+                    }
                 }
+                Err(e) => tracing::warn!(cu = %cu.name, error = %e, "debug_line scan failed"),
             }
-            Err(e) => tracing::warn!(cu = %cu.name, error = %e, "debug_line scan failed"),
         }
     }
 
@@ -452,9 +456,14 @@ struct DataSectionSlot {
     needs_relocs: bool,
 }
 
+pub struct SharedDataOptions {
+    pub dwarf: bool,
+}
+
 pub fn emit_shared_data(
     binary: &Binary<'_>,
     symbols: &GlobalSymbols,
+    opts: SharedDataOptions,
     out_path: &Path,
 ) -> Result<SharedDataStats> {
     let mut obj = Object::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
@@ -570,6 +579,9 @@ pub fn emit_shared_data(
     let mut debug_ranges_info: Option<(SectionId, &[u8])> = None;
     let mut debug_loc_info: Option<(SectionId, &[u8])> = None;
 
+    if !opts.dwarf {
+        // Skip DWARF emission entirely in shared data too.
+    } else {
     for dwarf_shared in [
         ".debug_str",
         ".debug_line_str",
@@ -639,6 +651,7 @@ pub fn emit_shared_data(
         }
         stats.debug_loc_relocs = diag.loc_pairs_resolved;
     }
+    } // end if opts.dwarf
 
     // Emit every DWARF-named global as a defined symbol in the section
     // whose range contains it, so per-CU `.o`s can resolve by name.
@@ -941,6 +954,7 @@ pub fn split_all(
     symbols: &GlobalSymbols,
     out_dir: &Path,
     comdat: bool,
+    dwarf: bool,
 ) -> Result<Vec<CuOutcome>> {
     use rayon::prelude::*;
     std::fs::create_dir_all(out_dir)
@@ -959,6 +973,7 @@ pub fn split_all(
                     cu,
                     symbols,
                     comdat,
+                    dwarf,
                 },
                 &file,
             )

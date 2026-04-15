@@ -27,6 +27,10 @@ enum Cmd {
         /// from objdiff.
         #[arg(long)]
         comdat: bool,
+        /// Emit per-CU DWARF slices with reloc synthesis. Off by default
+        /// because parsers like objdiff can choke on the sliced form.
+        #[arg(long)]
+        dwarf: bool,
     },
 
     /// List CUs matching a substring, sorted by .text size ascending.
@@ -58,6 +62,10 @@ enum Cmd {
         /// Turn on for actual relink-time dedup of inline/template dupes.
         #[arg(long)]
         comdat: bool,
+        /// Emit per-CU DWARF slices with reloc synthesis. Off by default
+        /// because parsers like objdiff can choke on the sliced form.
+        #[arg(long)]
+        dwarf: bool,
     },
 }
 
@@ -73,15 +81,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Inspect { input } => cmd_inspect(&input),
-        Cmd::Emit { input, cu, output, comdat } => cmd_emit(&input, &cu, &output, comdat),
+        Cmd::Emit { input, cu, output, comdat, dwarf } => {
+            cmd_emit(&input, &cu, &output, comdat, dwarf)
+        }
         Cmd::ListCus { input, contains, limit } => cmd_list_cus(&input, &contains, limit),
         Cmd::Readobj { input } => cmd_readobj(&input),
         Cmd::EmitShared { input, output } => cmd_emit_shared(&input, &output),
-        Cmd::Split { input, outdir, comdat } => cmd_split(&input, &outdir, comdat),
+        Cmd::Split { input, outdir, comdat, dwarf } => cmd_split(&input, &outdir, comdat, dwarf),
     }
 }
 
-fn cmd_split(path: &Path, outdir: &Path, comdat: bool) -> Result<()> {
+fn cmd_split(path: &Path, outdir: &Path, comdat: bool, dwarf: bool) -> Result<()> {
     let mmap = mmap_file(path)?;
     let binary = open_binary(&mmap, path)?;
     tracing::info!("indexing DWARF…");
@@ -92,9 +102,14 @@ fn cmd_split(path: &Path, outdir: &Path, comdat: bool) -> Result<()> {
         "emitting {} CUs in parallel",
         idx.units.iter().filter(|u| u.functions.iter().any(|f| f.size > 0)).count()
     );
-    let outcomes = delink_emit::split_all(&binary, &idx, &symbols, outdir, comdat)?;
+    let outcomes = delink_emit::split_all(&binary, &idx, &symbols, outdir, comdat, dwarf)?;
     let shared = outdir.join("__shared_data.o");
-    let shared_stats = delink_emit::emit_shared_data(&binary, &symbols, &shared)?;
+    let shared_stats = delink_emit::emit_shared_data(
+        &binary,
+        &symbols,
+        delink_emit::SharedDataOptions { dwarf },
+        &shared,
+    )?;
 
     let mut total = delink_emit::EmitStats::default();
     let mut failures = 0usize;
@@ -142,7 +157,12 @@ fn cmd_emit_shared(path: &Path, output: &Path) -> Result<()> {
     let binary = open_binary(&mmap, path)?;
     let idx = delink_core::cu::CuIndex::build(&binary)?;
     let symbols = delink_core::symbols::GlobalSymbols::build(&binary, &idx)?;
-    let stats = delink_emit::emit_shared_data(&binary, &symbols, output)?;
+    let stats = delink_emit::emit_shared_data(
+        &binary,
+        &symbols,
+        delink_emit::SharedDataOptions { dwarf: true },
+        output,
+    )?;
     println!(
         "wrote {}\n  .rodata: {} bytes\n  .data: {} bytes\n  .data.rel.ro: {} bytes\n  .init_array: {} bytes\n  .fini_array: {} bytes\n  .bss: {} bytes\n  .eh_frame: {} bytes ({} FDE relocs)\n  data relocs: {} RELATIVE + {} ABS64 + {} GLOB_DAT translated; {} skipped, {} unresolved",
         output.display(),
@@ -282,7 +302,13 @@ fn cmd_inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_emit(path: &Path, cu_needle: &str, output: &Path, comdat: bool) -> Result<()> {
+fn cmd_emit(
+    path: &Path,
+    cu_needle: &str,
+    output: &Path,
+    comdat: bool,
+    dwarf: bool,
+) -> Result<()> {
     let mmap = mmap_file(path)?;
     let binary = open_binary(&mmap, path)?;
     let idx = delink_core::cu::CuIndex::build(&binary)?;
@@ -309,6 +335,7 @@ fn cmd_emit(path: &Path, cu_needle: &str, output: &Path, comdat: bool) -> Result
             cu,
             symbols: &symbols,
             comdat,
+            dwarf,
         },
         output,
     )?;
