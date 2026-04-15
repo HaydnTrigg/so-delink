@@ -13,7 +13,9 @@ use delink_core::symbols::{
     read_all_dyn_relocs, DynReloc, GlobalSymbols, SYM_BSS_START, SYM_DATA_REL_RO_START,
     SYM_DATA_START, SYM_RODATA_START,
 };
-use object::write::{Comdat, Object, Relocation, SectionId, Symbol, SymbolId, SymbolSection};
+use object::write::{
+    Comdat, Object, Relocation, SectionId, StandardSection, Symbol, SymbolId, SymbolSection,
+};
 use object::{
     Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags,
     SectionKind, SymbolFlags, SymbolKind, SymbolScope,
@@ -35,6 +37,12 @@ pub struct EmitOptions<'a> {
     /// original DWARF which some parsers stumble on post-slice, and many
     /// workflows (objdiff, relink correctness) don't need it.
     pub dwarf: bool,
+    /// When true, emit one `.text.<mangled>` section per function
+    /// (standard `-ffunction-sections` output). When false, emit a
+    /// single `.text` section per `.o` with functions laid out
+    /// back-to-back and symbols at their section offsets — the layout
+    /// objdiff and similar tools expect.
+    pub per_function_sections: bool,
 }
 
 #[derive(Debug, Default)]
@@ -87,10 +95,16 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
 
     let mut obj = Object::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
 
-    // Pass 1: create a section + symbol for every live function so that
-    // intra-CU references resolve to local symbols during reloc emission.
+    // Functions are laid out sorted by original address. In the default
+    // single-.text layout, this preserves the relative order of the input
+    // so disassembly-and-diff tools see something close to the original.
+    let mut live_functions = live_functions;
+    live_functions.sort_by_key(|f| f.addr);
+
     struct FunctionSlot {
         section_id: SectionId,
+        /// Byte offset within `section_id` where this function's bytes live.
+        section_offset: u64,
         addr: u64,
         size: u64,
     }
@@ -98,41 +112,55 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
     let mut local_syms: HashMap<String, SymbolId> = HashMap::new();
     let mut total_text_bytes: u64 = 0;
 
+    // Create a single `.text` section up front if we're in shared mode.
+    let shared_text: Option<SectionId> = if opts.per_function_sections {
+        None
+    } else {
+        Some(obj.section_id(StandardSection::Text))
+    };
+
     for f in &live_functions {
         let raw_name = f
             .linkage_name
             .as_deref()
             .unwrap_or(f.name.as_str());
-        // Anonymous functions (no linkage_name, no DW_AT_name) get a
-        // synthesized name so every symbol is unique and linkable.
         let name = if raw_name.is_empty() || raw_name == "<anon>" {
             format!("__delink_sub_{:x}", f.addr)
         } else {
             raw_name.to_string()
         };
 
-        let section_name = format!(".text.{}", sanitize_section_suffix(&name));
-        let section_id = obj.add_section(
-            Vec::new(),
-            section_name.into_bytes(),
-            SectionKind::Text,
-        );
-
         let start = (f.addr - text_base) as usize;
         let end = start + f.size as usize;
-        obj.append_section_data(section_id, &text_data[start..end], 4);
+
+        let (section_id, section_offset) = match shared_text {
+            Some(sid) => {
+                let off = obj.append_section_data(sid, &text_data[start..end], 4);
+                (sid, off)
+            }
+            None => {
+                let section_name = format!(".text.{}", sanitize_section_suffix(&name));
+                let sid = obj.add_section(
+                    Vec::new(),
+                    section_name.into_bytes(),
+                    SectionKind::Text,
+                );
+                obj.append_section_data(sid, &text_data[start..end], 4);
+                (sid, 0)
+            }
+        };
         total_text_bytes += f.size;
 
         let scope = if f.external {
-            SymbolScope::Linkage
+            SymbolScope::Dynamic
         } else {
             SymbolScope::Compilation
         };
-        let is_linkage = matches!(scope, SymbolScope::Linkage);
-        let weak = opts.comdat && is_linkage;
+        let is_linkage = matches!(scope, SymbolScope::Dynamic);
+        let weak = opts.comdat && opts.per_function_sections && is_linkage;
         let symbol_id = obj.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
-            value: 0,
+            value: section_offset,
             size: f.size,
             kind: SymbolKind::Text,
             scope,
@@ -142,7 +170,9 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
         });
         local_syms.insert(name.clone(), symbol_id);
 
-        if opts.comdat && is_linkage {
+        // COMDAT only makes sense per-function-sections — can't dedupe
+        // functions at the section level when they share a section.
+        if opts.comdat && opts.per_function_sections && is_linkage {
             obj.add_comdat(Comdat {
                 kind: object::ComdatKind::Any,
                 symbol: symbol_id,
@@ -152,6 +182,7 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
 
         slots.push(FunctionSlot {
             section_id,
+            section_offset,
             addr: f.addr,
             size: f.size,
         });
@@ -176,16 +207,20 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
             let flags = RelocationFlags::Elf {
                 r_type: elf_reloc_type(r.kind),
             };
+            // `r.offset` is the instruction offset within this function
+            // (0..f.size). Translate to the offset within the target ELF
+            // section, which differs between layout modes.
+            let section_offset = slot.section_offset + r.offset;
             obj.add_relocation(
                 slot.section_id,
                 Relocation {
-                    offset: r.offset,
+                    offset: section_offset,
                     symbol: sym_id,
                     addend: r.addend,
                     flags,
                 },
             )
-            .with_context(|| format!("add reloc at {:#x}", r.offset))?;
+            .with_context(|| format!("add reloc at {:#x}", section_offset))?;
             relocations += 1;
         }
         agg.instructions += rec.diag.instructions;
@@ -389,7 +424,7 @@ fn resolve_symbol(
         value: 0,
         size: 0,
         kind: SymbolKind::Text,
-        scope: SymbolScope::Linkage,
+        scope: SymbolScope::Dynamic,
         weak: false,
         section: SymbolSection::Undefined,
         flags: SymbolFlags::None,
@@ -622,7 +657,7 @@ pub fn emit_shared_data(
                     value: 0,
                     size: 0,
                     kind: SymbolKind::Data,
-                    scope: SymbolScope::Linkage,
+                    scope: SymbolScope::Dynamic,
                     weak: false,
                     section: SymbolSection::Section(sid),
                     flags: SymbolFlags::None,
@@ -672,7 +707,7 @@ pub fn emit_shared_data(
             size: 0,
             kind: SymbolKind::Data,
             scope: if var.external {
-                SymbolScope::Linkage
+                SymbolScope::Dynamic
             } else {
                 SymbolScope::Compilation
             },
@@ -903,7 +938,7 @@ fn resolve_or_add_undef(
         value: 0,
         size: 0,
         kind: SymbolKind::Unknown,
-        scope: SymbolScope::Linkage,
+        scope: SymbolScope::Dynamic,
         weak: false,
         section: SymbolSection::Undefined,
         flags: SymbolFlags::None,
@@ -918,7 +953,7 @@ fn add_start_symbol(obj: &mut Object, section_id: SectionId, name: &str) {
         value: 0,
         size: 0,
         kind: SymbolKind::Data,
-        scope: SymbolScope::Linkage,
+        scope: SymbolScope::Dynamic,
         weak: false,
         section: SymbolSection::Section(section_id),
         flags: SymbolFlags::None,
@@ -955,6 +990,7 @@ pub fn split_all(
     out_dir: &Path,
     comdat: bool,
     dwarf: bool,
+    per_function_sections: bool,
 ) -> Result<Vec<CuOutcome>> {
     use rayon::prelude::*;
     std::fs::create_dir_all(out_dir)
@@ -974,6 +1010,7 @@ pub fn split_all(
                     symbols,
                     comdat,
                     dwarf,
+                    per_function_sections,
                 },
                 &file,
             )

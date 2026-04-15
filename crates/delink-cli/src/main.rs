@@ -22,15 +22,13 @@ enum Cmd {
         cu: String,
         #[arg(short, long)]
         output: PathBuf,
-        /// Emit linkage-scope functions as weak + COMDAT groups. Enables
-        /// link-time dedup of duplicate mangled names but hides symbols
-        /// from objdiff.
         #[arg(long)]
         comdat: bool,
-        /// Emit per-CU DWARF slices with reloc synthesis. Off by default
-        /// because parsers like objdiff can choke on the sliced form.
         #[arg(long)]
         dwarf: bool,
+        /// Emit one `.text.<mangled>` per function (default: single `.text`).
+        #[arg(long)]
+        per_function_sections: bool,
     },
 
     /// List CUs matching a substring, sorted by .text size ascending.
@@ -57,15 +55,14 @@ enum Cmd {
         input: PathBuf,
         #[arg(short, long)]
         outdir: PathBuf,
-        /// Emit linkage-scope functions as weak + COMDAT groups. Off by
-        /// default because some tools (e.g. objdiff) hide such symbols.
-        /// Turn on for actual relink-time dedup of inline/template dupes.
         #[arg(long)]
         comdat: bool,
-        /// Emit per-CU DWARF slices with reloc synthesis. Off by default
-        /// because parsers like objdiff can choke on the sliced form.
         #[arg(long)]
         dwarf: bool,
+        /// Emit one `.text.<mangled>` per function (default: single `.text`).
+        /// Required for `--comdat` and for `ld --gc-sections` to work.
+        #[arg(long)]
+        per_function_sections: bool,
     },
 }
 
@@ -81,17 +78,34 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Inspect { input } => cmd_inspect(&input),
-        Cmd::Emit { input, cu, output, comdat, dwarf } => {
-            cmd_emit(&input, &cu, &output, comdat, dwarf)
-        }
+        Cmd::Emit {
+            input,
+            cu,
+            output,
+            comdat,
+            dwarf,
+            per_function_sections,
+        } => cmd_emit(&input, &cu, &output, comdat, dwarf, per_function_sections),
         Cmd::ListCus { input, contains, limit } => cmd_list_cus(&input, &contains, limit),
         Cmd::Readobj { input } => cmd_readobj(&input),
         Cmd::EmitShared { input, output } => cmd_emit_shared(&input, &output),
-        Cmd::Split { input, outdir, comdat, dwarf } => cmd_split(&input, &outdir, comdat, dwarf),
+        Cmd::Split {
+            input,
+            outdir,
+            comdat,
+            dwarf,
+            per_function_sections,
+        } => cmd_split(&input, &outdir, comdat, dwarf, per_function_sections),
     }
 }
 
-fn cmd_split(path: &Path, outdir: &Path, comdat: bool, dwarf: bool) -> Result<()> {
+fn cmd_split(
+    path: &Path,
+    outdir: &Path,
+    comdat: bool,
+    dwarf: bool,
+    per_function_sections: bool,
+) -> Result<()> {
     let mmap = mmap_file(path)?;
     let binary = open_binary(&mmap, path)?;
     tracing::info!("indexing DWARF…");
@@ -102,7 +116,15 @@ fn cmd_split(path: &Path, outdir: &Path, comdat: bool, dwarf: bool) -> Result<()
         "emitting {} CUs in parallel",
         idx.units.iter().filter(|u| u.functions.iter().any(|f| f.size > 0)).count()
     );
-    let outcomes = delink_emit::split_all(&binary, &idx, &symbols, outdir, comdat, dwarf)?;
+    let outcomes = delink_emit::split_all(
+        &binary,
+        &idx,
+        &symbols,
+        outdir,
+        comdat,
+        dwarf,
+        per_function_sections,
+    )?;
     let shared = outdir.join("__shared_data.o");
     let shared_stats = delink_emit::emit_shared_data(
         &binary,
@@ -308,6 +330,7 @@ fn cmd_emit(
     output: &Path,
     comdat: bool,
     dwarf: bool,
+    per_function_sections: bool,
 ) -> Result<()> {
     let mmap = mmap_file(path)?;
     let binary = open_binary(&mmap, path)?;
@@ -336,6 +359,7 @@ fn cmd_emit(
             symbols: &symbols,
             comdat,
             dwarf,
+            per_function_sections,
         },
         output,
     )?;
