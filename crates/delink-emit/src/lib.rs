@@ -24,6 +24,12 @@ use std::path::Path;
 pub struct EmitOptions<'a> {
     pub cu: &'a CompilationUnit,
     pub symbols: &'a GlobalSymbols,
+    /// Emit linkage-scope functions as `STB_WEAK` inside `GRP_COMDAT`
+    /// section groups so the linker dedupes duplicate mangled names
+    /// across CUs (inline / template instantiations). Off by default
+    /// because some analysis tools (objdiff) hide COMDAT-grouped weak
+    /// symbols from their UI.
+    pub comdat: bool,
 }
 
 #[derive(Debug, Default)]
@@ -117,23 +123,21 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
         } else {
             SymbolScope::Compilation
         };
-        // Linkage-scope symbols get weak+COMDAT. Inline functions and
-        // template instantiations duplicate across CUs with the same mangled
-        // name; the linker picks one copy.
         let is_linkage = matches!(scope, SymbolScope::Linkage);
+        let weak = opts.comdat && is_linkage;
         let symbol_id = obj.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
             value: 0,
             size: f.size,
             kind: SymbolKind::Text,
             scope,
-            weak: is_linkage,
+            weak,
             section: SymbolSection::Section(section_id),
             flags: SymbolFlags::None,
         });
         local_syms.insert(name.clone(), symbol_id);
 
-        if is_linkage {
+        if opts.comdat && is_linkage {
             obj.add_comdat(Comdat {
                 kind: object::ComdatKind::Any,
                 symbol: symbol_id,
@@ -936,6 +940,7 @@ pub fn split_all(
     idx: &delink_core::cu::CuIndex,
     symbols: &GlobalSymbols,
     out_dir: &Path,
+    comdat: bool,
 ) -> Result<Vec<CuOutcome>> {
     use rayon::prelude::*;
     std::fs::create_dir_all(out_dir)
@@ -948,8 +953,16 @@ pub fn split_all(
         .map(|cu| {
             let stem = sanitize_cu_name(&cu.name);
             let file = out_dir.join(format!("{:04}_{stem}.o", cu.id));
-            let result = emit_cu(binary, EmitOptions { cu, symbols }, &file)
-                .map_err(|e| format!("{e:#}"));
+            let result = emit_cu(
+                binary,
+                EmitOptions {
+                    cu,
+                    symbols,
+                    comdat,
+                },
+                &file,
+            )
+            .map_err(|e| format!("{e:#}"));
             CuOutcome {
                 cu_name: cu.name.clone(),
                 file,

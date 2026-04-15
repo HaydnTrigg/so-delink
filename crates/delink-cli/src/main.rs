@@ -22,6 +22,11 @@ enum Cmd {
         cu: String,
         #[arg(short, long)]
         output: PathBuf,
+        /// Emit linkage-scope functions as weak + COMDAT groups. Enables
+        /// link-time dedup of duplicate mangled names but hides symbols
+        /// from objdiff.
+        #[arg(long)]
+        comdat: bool,
     },
 
     /// List CUs matching a substring, sorted by .text size ascending.
@@ -48,6 +53,11 @@ enum Cmd {
         input: PathBuf,
         #[arg(short, long)]
         outdir: PathBuf,
+        /// Emit linkage-scope functions as weak + COMDAT groups. Off by
+        /// default because some tools (e.g. objdiff) hide such symbols.
+        /// Turn on for actual relink-time dedup of inline/template dupes.
+        #[arg(long)]
+        comdat: bool,
     },
 }
 
@@ -63,15 +73,15 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Inspect { input } => cmd_inspect(&input),
-        Cmd::Emit { input, cu, output } => cmd_emit(&input, &cu, &output),
+        Cmd::Emit { input, cu, output, comdat } => cmd_emit(&input, &cu, &output, comdat),
         Cmd::ListCus { input, contains, limit } => cmd_list_cus(&input, &contains, limit),
         Cmd::Readobj { input } => cmd_readobj(&input),
         Cmd::EmitShared { input, output } => cmd_emit_shared(&input, &output),
-        Cmd::Split { input, outdir } => cmd_split(&input, &outdir),
+        Cmd::Split { input, outdir, comdat } => cmd_split(&input, &outdir, comdat),
     }
 }
 
-fn cmd_split(path: &Path, outdir: &Path) -> Result<()> {
+fn cmd_split(path: &Path, outdir: &Path, comdat: bool) -> Result<()> {
     let mmap = mmap_file(path)?;
     let binary = open_binary(&mmap, path)?;
     tracing::info!("indexing DWARF…");
@@ -82,7 +92,7 @@ fn cmd_split(path: &Path, outdir: &Path) -> Result<()> {
         "emitting {} CUs in parallel",
         idx.units.iter().filter(|u| u.functions.iter().any(|f| f.size > 0)).count()
     );
-    let outcomes = delink_emit::split_all(&binary, &idx, &symbols, outdir)?;
+    let outcomes = delink_emit::split_all(&binary, &idx, &symbols, outdir, comdat)?;
     let shared = outdir.join("__shared_data.o");
     let shared_stats = delink_emit::emit_shared_data(&binary, &symbols, &shared)?;
 
@@ -272,7 +282,7 @@ fn cmd_inspect(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_emit(path: &Path, cu_needle: &str, output: &Path) -> Result<()> {
+fn cmd_emit(path: &Path, cu_needle: &str, output: &Path, comdat: bool) -> Result<()> {
     let mmap = mmap_file(path)?;
     let binary = open_binary(&mmap, path)?;
     let idx = delink_core::cu::CuIndex::build(&binary)?;
@@ -295,7 +305,11 @@ fn cmd_emit(path: &Path, cu_needle: &str, output: &Path) -> Result<()> {
 
     let stats = delink_emit::emit_cu(
         &binary,
-        delink_emit::EmitOptions { cu, symbols: &symbols },
+        delink_emit::EmitOptions {
+            cu,
+            symbols: &symbols,
+            comdat,
+        },
         output,
     )?;
     println!(
