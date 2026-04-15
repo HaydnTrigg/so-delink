@@ -1,0 +1,14 @@
+[package]
+name = "delink-arch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+object.workspace = true
+delink-core.workspace = true

@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/delink-core",
+    "crates/delink-arch",
+    "crates/delink-aarch64",
+    "crates/delink-emit",
+    "crates/delink-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/camden/so-delink"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memmap2 = "0.9"
+object = { version = "0.36", default-features = false, features = ["read", "write", "elf", "std"] }
+gimli = { version = "0.31", default-features = false, features = ["read", "std"] }
+addr2line = { version = "0.24", default-features = false, features = ["std", "loader"] }
+capstone = "0.13"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+insta = { version = "1", features = ["yaml"] }
+
+delink-core = { path = "crates/delink-core" }
+delink-arch = { path = "crates/delink-arch" }
+delink-aarch64 = { path = "crates/delink-aarch64" }
+delink-emit = { path = "crates/delink-emit" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

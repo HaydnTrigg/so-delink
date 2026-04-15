@@ -1,0 +1,21 @@
+[package]
+name = "delink-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "so-delink"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+delink-core.workspace = true
+delink-emit.workspace = true
+memmap2.workspace = true
+object.workspace = true

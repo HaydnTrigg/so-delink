@@ -1,0 +1,15 @@
+[package]
+name = "delink-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+memmap2.workspace = true
+object.workspace = true
+gimli.workspace = true
