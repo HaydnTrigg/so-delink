@@ -3,6 +3,8 @@
 //! `.bss` bytes referenced by every other `.o` through named section-start
 //! globals.
 
+pub mod dwarf_relocs;
+
 use anyhow::{anyhow, Context, Result};
 use delink_aarch64::{recover, RelocKind};
 use delink_core::binary::Binary;
@@ -11,7 +13,7 @@ use delink_core::symbols::{
     read_all_dyn_relocs, DynReloc, GlobalSymbols, SYM_BSS_START, SYM_DATA_REL_RO_START,
     SYM_DATA_START, SYM_RODATA_START,
 };
-use object::write::{Object, Relocation, SectionId, Symbol, SymbolId, SymbolSection};
+use object::write::{Comdat, Object, Relocation, SectionId, Symbol, SymbolId, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags,
     SectionKind, SymbolFlags, SymbolKind, SymbolScope,
@@ -37,6 +39,7 @@ pub struct EmitStats {
     pub adrp_seen: usize,
     pub adrp_paired: usize,
     pub adrp_unresolved: usize,
+    pub dwarf_bytes: u64,
 }
 
 pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> Result<EmitStats> {
@@ -114,17 +117,29 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
         } else {
             SymbolScope::Compilation
         };
+        // Linkage-scope symbols get weak+COMDAT. Inline functions and
+        // template instantiations duplicate across CUs with the same mangled
+        // name; the linker picks one copy.
+        let is_linkage = matches!(scope, SymbolScope::Linkage);
         let symbol_id = obj.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
             value: 0,
             size: f.size,
             kind: SymbolKind::Text,
             scope,
-            weak: false,
+            weak: is_linkage,
             section: SymbolSection::Section(section_id),
             flags: SymbolFlags::None,
         });
-        local_syms.insert(name, symbol_id);
+        local_syms.insert(name.clone(), symbol_id);
+
+        if is_linkage {
+            obj.add_comdat(Comdat {
+                kind: object::ComdatKind::Any,
+                symbol: symbol_id,
+                sections: vec![section_id],
+            });
+        }
 
         slots.push(FunctionSlot {
             section_id,
@@ -173,12 +188,81 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
         agg.adrp_unresolved += rec.diag.adrp_unresolved;
     }
 
+    // DWARF slices — per-CU .debug_info + .debug_abbrev + .debug_line.
+    // Each address-bearing field gets a relocation so the linker rewrites
+    // it for the new layout.
+    let (debug_info_section, debug_info_slice) = add_dwarf_slice(
+        &mut obj,
+        binary,
+        ".debug_info",
+        cu.debug_info_range.clone(),
+    );
+    add_dwarf_slice(
+        &mut obj,
+        binary,
+        ".debug_abbrev",
+        cu.debug_abbrev_range.clone(),
+    );
+    let (debug_line_section, debug_line_slice) = if let Some(range) = cu.debug_line_range.clone() {
+        add_dwarf_slice(&mut obj, binary, ".debug_line", range)
+    } else {
+        (None, None)
+    };
+
+    // Synthesize DWARF relocations.
+    if let (Some(info_section), Some(info_slice), Some(abbrev_slice)) = (
+        debug_info_section,
+        debug_info_slice,
+        dwarf_section_slice(binary, ".debug_abbrev", cu.debug_abbrev_range.clone()),
+    ) {
+        match dwarf_relocs::scan_debug_info(info_slice, abbrev_slice, globals) {
+            Ok((recs, _diag)) => {
+                for r in recs {
+                    attach_dwarf_reloc(
+                        &mut obj,
+                        info_section,
+                        &mut local_syms,
+                        &mut undef_cache,
+                        &r,
+                    )?;
+                }
+            }
+            Err(e) => tracing::warn!(cu = %cu.name, error = %e, "debug_info scan failed"),
+        }
+    }
+
+    if let (Some(line_section), Some(line_slice)) = (debug_line_section, debug_line_slice) {
+        match dwarf_relocs::scan_debug_line(line_slice, globals) {
+            Ok((recs, _diag)) => {
+                for r in recs {
+                    attach_dwarf_reloc(
+                        &mut obj,
+                        line_section,
+                        &mut local_syms,
+                        &mut undef_cache,
+                        &r,
+                    )?;
+                }
+            }
+            Err(e) => tracing::warn!(cu = %cu.name, error = %e, "debug_line scan failed"),
+        }
+    }
+
     let bytes = obj.write().context("serialize ET_REL")?;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(out_path, &bytes)
         .with_context(|| format!("write {}", out_path.display()))?;
+
+    let dwarf_bytes = (cu.debug_info_range.end.saturating_sub(cu.debug_info_range.start)
+        + cu.debug_abbrev_range
+            .end
+            .saturating_sub(cu.debug_abbrev_range.start)
+        + cu.debug_line_range
+            .as_ref()
+            .map(|r| r.end - r.start)
+            .unwrap_or(0)) as u64;
 
     Ok(EmitStats {
         text_bytes: total_text_bytes,
@@ -192,7 +276,75 @@ pub fn emit_cu(binary: &Binary<'_>, opts: EmitOptions<'_>, out_path: &Path) -> R
         adrp_seen: agg.adrp_seen,
         adrp_paired: agg.adrp_paired,
         adrp_unresolved: agg.adrp_unresolved,
+        dwarf_bytes,
     })
+}
+
+/// Copy a byte slice of a DWARF section into the output object and return
+/// the new section id + a borrow of the slice (for follow-up reloc scans).
+fn add_dwarf_slice<'a>(
+    obj: &mut Object,
+    binary: &'a Binary<'_>,
+    section_name: &str,
+    range: std::ops::Range<usize>,
+) -> (Option<SectionId>, Option<&'a [u8]>) {
+    let slice = dwarf_section_slice(binary, section_name, range);
+    let Some(slice) = slice else {
+        return (None, None);
+    };
+    let kind = if section_name == ".debug_str" || section_name == ".debug_line_str" {
+        SectionKind::DebugString
+    } else {
+        SectionKind::Debug
+    };
+    let section_id = obj.add_section(Vec::new(), section_name.as_bytes().to_vec(), kind);
+    obj.append_section_data(section_id, slice, 1);
+    (Some(section_id), Some(slice))
+}
+
+fn dwarf_section_slice<'a>(
+    binary: &'a Binary<'_>,
+    section_name: &str,
+    range: std::ops::Range<usize>,
+) -> Option<&'a [u8]> {
+    let section = binary.elf.section_by_name(section_name)?;
+    let data = section.data().ok()?;
+    if range.start >= data.len() || range.end > data.len() || range.start >= range.end {
+        return None;
+    }
+    Some(&data[range])
+}
+
+fn attach_dwarf_reloc(
+    obj: &mut Object,
+    section_id: SectionId,
+    local_syms: &mut HashMap<String, SymbolId>,
+    undef_cache: &mut HashMap<String, SymbolId>,
+    reloc: &dwarf_relocs::DwarfReloc,
+) -> Result<()> {
+    let (offset, symbol, addend, r_type) = match reloc {
+        dwarf_relocs::DwarfReloc::Abs64 {
+            offset,
+            symbol,
+            addend,
+        } => (*offset, symbol, *addend, object::elf::R_AARCH64_ABS64),
+        dwarf_relocs::DwarfReloc::Abs32 {
+            offset,
+            symbol,
+            addend,
+        } => (*offset, symbol, *addend, object::elf::R_AARCH64_ABS32),
+    };
+    let sym_id = resolve_symbol(obj, local_syms, undef_cache, symbol);
+    obj.add_relocation(
+        section_id,
+        Relocation {
+            offset,
+            symbol: sym_id,
+            addend,
+            flags: RelocationFlags::Elf { r_type },
+        },
+    )
+    .map_err(Into::into)
 }
 
 /// Sanitize a mangled symbol into something safe as a section-name suffix.
@@ -278,6 +430,9 @@ pub struct SharedDataStats {
     pub fini_array_bytes: u64,
     pub bss_bytes: u64,
     pub eh_frame_bytes: u64,
+    pub dwarf_shared_bytes: u64,
+    pub debug_ranges_relocs: usize,
+    pub debug_loc_relocs: usize,
     pub translated_relatives: usize,
     pub translated_abs64: usize,
     pub translated_glob_dat: usize,
@@ -399,6 +554,86 @@ pub fn emit_shared_data(
         stats.eh_frame_bytes = data.len() as u64;
         stats.fde_relocs =
             translate_eh_frame(&mut obj, section_id, data, section.address(), symbols, &mut undef_cache)?;
+    }
+
+    // DWARF sections that are shared across all per-CU `.o`s go here. Per-CU
+    // `.debug_info`/`.debug_abbrev`/`.debug_line` live in each CU's own `.o`
+    // (see emit_cu), and reference these shared sections by raw offset.
+    //
+    // For address-bearing shared sections (.debug_ranges / .debug_loc) we
+    // walk their content and attach per-pair relocations so the linker
+    // rewrites absolute VAs to point at the new function layout.
+    let mut debug_ranges_info: Option<(SectionId, &[u8])> = None;
+    let mut debug_loc_info: Option<(SectionId, &[u8])> = None;
+
+    for dwarf_shared in [
+        ".debug_str",
+        ".debug_line_str",
+        ".debug_str_offsets",
+        ".debug_ranges",
+        ".debug_rnglists",
+        ".debug_loc",
+        ".debug_loclists",
+        ".debug_addr",
+    ] {
+        if let Some(section) = binary.elf.section_by_name(dwarf_shared) {
+            let data = section.data().unwrap_or(&[]);
+            if data.is_empty() {
+                continue;
+            }
+            let kind = if dwarf_shared == ".debug_str" || dwarf_shared == ".debug_line_str" {
+                SectionKind::DebugString
+            } else {
+                SectionKind::Debug
+            };
+            let sid =
+                obj.add_section(Vec::new(), dwarf_shared.as_bytes().to_vec(), kind);
+            obj.append_section_data(sid, data, 1);
+            stats.dwarf_shared_bytes += data.len() as u64;
+
+            let start_sym = match dwarf_shared {
+                ".debug_str" => Some("__delink_debug_str_start"),
+                ".debug_line_str" => Some("__delink_debug_line_str_start"),
+                ".debug_ranges" => Some("__delink_debug_ranges_start"),
+                ".debug_rnglists" => Some("__delink_debug_rnglists_start"),
+                ".debug_loc" => Some("__delink_debug_loc_start"),
+                ".debug_loclists" => Some("__delink_debug_loclists_start"),
+                _ => None,
+            };
+            if let Some(sym) = start_sym {
+                obj.add_symbol(Symbol {
+                    name: sym.as_bytes().to_vec(),
+                    value: 0,
+                    size: 0,
+                    kind: SymbolKind::Data,
+                    scope: SymbolScope::Linkage,
+                    weak: false,
+                    section: SymbolSection::Section(sid),
+                    flags: SymbolFlags::None,
+                });
+            }
+
+            if dwarf_shared == ".debug_ranges" {
+                debug_ranges_info = Some((sid, data));
+            } else if dwarf_shared == ".debug_loc" {
+                debug_loc_info = Some((sid, data));
+            }
+        }
+    }
+
+    if let Some((sid, data)) = debug_ranges_info {
+        let (recs, diag) = dwarf_relocs::scan_debug_ranges(data, 8, symbols);
+        for r in recs {
+            attach_dwarf_reloc(&mut obj, sid, &mut HashMap::new(), &mut undef_cache, &r)?;
+        }
+        stats.debug_ranges_relocs = diag.range_pairs_resolved;
+    }
+    if let Some((sid, data)) = debug_loc_info {
+        let (recs, diag) = dwarf_relocs::scan_debug_loc(data, 8, symbols);
+        for r in recs {
+            attach_dwarf_reloc(&mut obj, sid, &mut HashMap::new(), &mut undef_cache, &r)?;
+        }
+        stats.debug_loc_relocs = diag.loc_pairs_resolved;
     }
 
     // Emit every DWARF-named global as a defined symbol in the section
